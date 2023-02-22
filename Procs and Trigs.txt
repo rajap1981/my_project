@@ -1153,4 +1153,10 @@ create or replace trigger bse.lolig_trans_trg
 begin
     select bse.lolig_trans_seq.nextval 
         into :new.id from dual;
+        
+        create or replace trigger bse.lolig_trans_trg
+    before insert on bse.lolig_trans for each row
+begin
+    select bse.lolig_trans_seq.nextval 
+        into :new.id from dual;
 end;
