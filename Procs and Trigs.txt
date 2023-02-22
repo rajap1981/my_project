@@ -1,0 +1,1156 @@
+HSTT_RULE_PH_BB_TRNFR_AWAY
+
+
+create or replace PROCEDURE        hstt_rule_ph_bb_trnfr_away (i_rec_h           IN     hstt_pkg.r_hst_ord_so_ext_data%ROWTYPE,
+                                                               i_rec_so          IN     arbor.ord_service_order%ROWTYPE,
+                                                               i_rec_ded         IN     hst_ord_so_ext_data%ROWTYPE,
+                                                               i_system_token    IN     hstt_pkg.vchr2_vchr2,
+                                                               io_rule_applied   IN OUT VARCHAR2,                                                 -- Check this value if previous rule applied
+                                                               -- Precendence of procedure/event calls will have to be looked at
+                                                               -- for this to work
+                                                               i_ctm_sysout      IN     VARCHAR2,
+                                                               i_rule            IN     VARCHAR2)
+AS
+   -- *******************************************************************************************************
+   -- *  Both voice and broadband services transfer away SMS/email
+   -- *
+   -- *  Event name: PH_BB_TRANS_AWAY
+   -- *******************************************************************************************************
+   -- Version  Date         Who          Jira       Comment
+   -- 1.00     20-JAN-2017  Kelly Ji     MTMI-525   Created
+   -- 1.01     25-NOV-2019  Sean Lee     NFFW-44    Implemented for INTERNET|NBN|FTTC, INTERNET|NBN|FXWL
+   -- *******************************************************************************************************
+
+   l_trnfr_cnt        NUMBER;
+   l_id               NUMBER;
+   l_comm_ord_xml     VARCHAR2 (4000);
+   l_scan_proc_name   VARCHAR2 (30);
+   l_processor_id     NUMBER;
+   l_first_time       BOOLEAN := TRUE;
+   l_error_msg        VARCHAR2 (1000);
+   row_error          EXCEPTION;
+   PRAGMA EXCEPTION_INIT (row_error, -20001);
+-- select * from arbor.generic_enumeration_values where enumeration_key = 'TW_Request_Type'
+-- 1   Port
+-- 2   Transfer
+-- 3   New Service
+-- 4   Disconnect
+-- 5   Slam Reversal
+-- 6   Held Complete
+-- 7   Change of Lessee
+-- 8   Transfer from SSS
+-- 9   Moving Home
+-- 10  Off Record Received
+-- 11  Pre Transition
+-- 12  Transition
+-- 13  DSL Transition Disconnect
+-- 14  Churn in Transition
+-- 15  NBN Transfer
+-- 16  ULL Transition
+
+--Param_ID (arbor.param_values.Param_ID)
+--9015 Telstra Completed Date
+--9018 Telstra Commitment Date
+--9019 TW Request Status
+--9020 TW Request Type
+
+BEGIN
+   IF     i_rec_h.param_value = 'Completed'                                                                                                                                          -- insert
+      AND (i_rec_ded.param_value <> 'Completed' OR i_rec_ded.param_value IS NULL)                                                                                                    -- delete
+      AND i_rec_so.service_order_type_id = 50                                                                                                                                    -- disconnect
+      AND i_rec_so.emf_config_id = 13                                                                                                                                              -- internet
+      AND i_rec_so.create_who NOT IN ('disconnectuser', 'raruser')                                                                                                 -- processed via the system
+   THEN
+      FOR r
+         IN (SELECT MAX (CASE WHEN oso.emf_config_id = 13 AND osoed.param_id = 9019 THEN osoed.param_value ELSE NULL END) AS internet_request_status,
+                    MAX (CASE WHEN oso.emf_config_id = 14 AND osoed.param_id = 9019 THEN osoed.param_value ELSE NULL END) AS voice_request_status,
+                    MAX (CASE WHEN oso.emf_config_id = 13 AND osoed.param_id = 9020 THEN osoed.param_value ELSE NULL END) AS internet_request_type,
+                    MAX (CASE WHEN oso.emf_config_id = 14 AND osoed.param_id = 9020 THEN osoed.param_value ELSE NULL END) AS voice_request_type,
+                    MAX (CASE WHEN oso.emf_config_id = 14 AND osoed.param_id = 9024 THEN osoed.param_value ELSE NULL END) AS assoc_fnn,
+                    MAX (CASE WHEN oso.emf_config_id = 13 AND sed.param_id = 7006 THEN sed.param_value ELSE NULL END) AS internet_port,
+                    MAX (CASE WHEN oso.emf_config_id = 14 AND sed.param_id = 7006 THEN sed.param_value ELSE NULL END) AS voice_port,
+                    MAX (CASE WHEN oso.emf_config_id = 13 THEN st.serv_type ELSE NULL END) AS internet_serv_type,
+                    MAX (CASE WHEN oso.emf_config_id = 14 THEN st.serv_type ELSE NULL END) AS voice_serv_type,
+                    MAX (CASE WHEN oso.emf_config_id = 13 THEN 1 ELSE 0 END) AS has_internet,
+                    MAX (CASE WHEN oso.emf_config_id = 14 THEN 1 ELSE 0 END) AS has_voice,
+                    MAX (em.external_id) AS phone_service,
+                    MAX (oo.account_no) AS account_no
+               FROM arbor.ord_order oo
+                    INNER JOIN arbor.ord_service_order oso
+                       ON oso.order_id = oo.order_id AND oso.service_order_type_id = 50                                                                                          -- disconnect
+                                                                                       AND oso.order_status_id NOT IN (86, 90)                              -- NOT IN cancel init or cancelled
+                                                                                                                              AND oso.create_who NOT IN ('disconnectuser', 'raruser') -- processed via the system
+                    LEFT JOIN arbor.ord_service_order_ext_data osoed ON osoed.service_order_id = oso.service_order_id
+                    LEFT JOIN arbor.service_view sv ON sv.subscr_no = oso.subscr_no AND sv.subscr_no_resets = oso.subscr_no_resets AND sv.view_status IN (1, 2)            -- pending, current
+                    LEFT JOIN arbor.service_view xsv ON xsv.prev_view_id = sv.view_id AND xsv.view_status IN (1, 2)                                                        -- pending, current
+                    LEFT JOIN arbor.service_ext_data sed ON sed.view_id = sv.view_id
+                    LEFT JOIN arbor.ord_item oi ON oi.service_order_id = oso.service_order_id AND oi.member_type = 40 AND oi.item_action_id = 30              -- package component, disconnect
+                    LEFT JOIN (SELECT emf_config_id, component_id, service_group || '|' || service_code || '|' || service_sub_code AS serv_type
+                                 FROM foxtel.om_service_type_vw_s
+                                WHERE emf_config_id IN (13, 14)) st                                                                                                         -- internet, voice
+                       ON st.emf_config_id = oso.emf_config_id AND st.component_id = oi.member_id
+                    LEFT JOIN arbor.customer_id_equip_map em ON sv.subscr_no = em.subscr_no AND em.external_id_type = 18                                                                -- FNN
+              WHERE oo.order_id = i_rec_so.order_id AND xsv.view_id IS NULL)
+      LOOP
+         IF     r.has_internet = 1
+            AND r.has_voice = 1
+            AND r.internet_request_type = 2
+            AND r.voice_request_type = 2
+            AND r.internet_request_status = 'Completed'
+            AND r.voice_request_status = 'Completed'
+            AND (   (r.internet_serv_type = 'INTERNET|PSTN|DSL' AND r.voice_serv_type = 'PHONE|PSTN|VOICE')                                                                  -- 991026, 991033
+                 OR (r.internet_serv_type = 'INTERNET|NBN|FTTP' AND r.voice_serv_type = 'PHONE|NBN|VOICE')                                                                   -- 991025, 991032
+                 OR (r.internet_serv_type = 'INTERNET|NBN|FTTN' AND r.voice_serv_type = 'PHONE|NBN|VOIP')                                                                    -- 991159, 991157
+                 OR (r.internet_serv_type = 'INTERNET|NBN|FTTB' AND r.voice_serv_type = 'PHONE|NBN|VOIP')                                                                    -- 991158, 991157
+                 OR (r.internet_serv_type = 'INTERNET|NBN|FTTC' AND r.voice_serv_type = 'PHONE|NBN|VOIP')                                                           --991223, 991157 --NFFW-44
+                 OR (r.internet_serv_type = 'INTERNET|NBN|FXWL' AND r.voice_serv_type = 'PHONE|NBN|VOIP')                                                           --991224, 991157 --NFFW-44
+                                                                                                         )
+         --and r.phone_service is not null
+         THEN
+            -- Get the default XML for BSE communication
+            BEGIN
+               l_comm_ord_xml := i_system_token ('BSE_CALL-COMM_ORDER_XML');
+            EXCEPTION
+               WHEN OTHERS
+               THEN
+                  raise_application_error (-20001, 'BSE_CALL-COMM_ORDER_XML token issue');
+            END;
+
+            -- Get scan procedure name
+            BEGIN
+               l_scan_proc_name := i_system_token ('SCAN_PROC_NAME');
+            EXCEPTION
+               WHEN OTHERS
+               THEN
+                  raise_application_error (-20001, 'SCAN_PROC_NAME token issue');
+            END;
+
+            -- Get processor
+            BEGIN
+               l_processor_id := i_system_token ('PROCESSOR_ID-' || l_scan_proc_name || '-ST-' || i_rule);
+            EXCEPTION
+               WHEN OTHERS
+               THEN
+                  raise_application_error (-20001, 'PROCESSOR_ID-' || l_scan_proc_name || '-ST-' || i_rule || ' token issue');
+            END;
+
+
+            SELECT hstt_event_seq.NEXTVAL INTO l_id FROM DUAL;
+
+            l_comm_ord_xml := REPLACE (l_comm_ord_xml, '<ExternalID></ExternalID>', '<ExternalID>' || l_id || '</ExternalID>');
+            l_comm_ord_xml := REPLACE (l_comm_ord_xml, '<AccountInternalId></AccountInternalId>', '<AccountInternalId>' || i_rec_so.account_no || '</AccountInternalId>');
+            l_comm_ord_xml := REPLACE (l_comm_ord_xml, '<OrderId></OrderId>', '<OrderId>' || i_rec_so.order_id || '</OrderId>');
+            l_comm_ord_xml := REPLACE (l_comm_ord_xml, '<ServiceOrderId></ServiceOrderId>', '<ServiceOrderId>' || i_rec_h.service_order_id || '</ServiceOrderId>');
+            l_comm_ord_xml := REPLACE (l_comm_ord_xml, '<CommunicationEvent></CommunicationEvent>', '<CommunicationEvent>' || i_rule || '</CommunicationEvent>');
+
+            IF r.phone_service IS NOT NULL
+            THEN
+               l_comm_ord_xml := REPLACE (l_comm_ord_xml, '<Parameter></Parameter>', '<Parameter><ParamName>FNN</ParamName><ParamValue>' || r.phone_service || '</ParamValue></Parameter>');
+            ELSE
+               l_comm_ord_xml := REPLACE (l_comm_ord_xml, '<Parameter></Parameter>');
+            END IF;
+
+            INSERT INTO hstt_event (event_id,
+                                    proc_name,
+                                    hst_id,
+                                    rule_name,
+                                    event_type,
+                                    account_no,
+                                    order_id,
+                                    service_order_id,
+                                    event_detail,
+                                    date_create,
+                                    date_last_updated,
+                                    ctm_sysout_scan)
+                 VALUES (l_id,
+                         l_scan_proc_name,
+                         i_rec_h.hst_id,
+                         i_rule,
+                         'BSE_CALL_' || l_processor_id,
+                         i_rec_so.account_no,
+                         i_rec_so.order_id,
+                         i_rec_h.service_order_id,
+                         l_comm_ord_xml,
+                         SYSDATE,
+                         SYSDATE,
+                         i_ctm_sysout);
+
+            io_rule_applied := io_rule_applied || i_rule || '|';
+            l_first_time := FALSE;
+
+            EXIT WHEN NOT l_first_time;
+         END IF;
+      END LOOP;
+   END IF;
+EXCEPTION
+   WHEN row_error
+   THEN
+      -- Row error
+      l_error_msg := i_rule || ' - ' || SUBSTR (SQLERRM, 12, 950);
+      raise_application_error (-20001, l_error_msg);
+   WHEN OTHERS
+   THEN
+      -- Unhandled error
+      l_error_msg := i_rule || ' - ' || SUBSTR (SQLERRM, 1, 950);
+      raise_application_error (-20002, l_error_msg);
+END;
+
+
+-------------------------------------------------------------------------------------
+
+HSTT_RULE_BROADBAND_TRNFR_AWAY
+
+
+
+create or replace procedure        hstt_rule_broadband_trnfr_away (i_rec_h           in     hstt_pkg.r_hst_ord_so_ext_data%rowtype,
+                                                                   i_rec_so          IN     arbor.ord_service_order%ROWTYPE,
+                                                                   i_rec_ded         IN     hst_ord_so_ext_data%ROWTYPE,
+                                                                   i_system_token    IN     hstt_pkg.vchr2_vchr2,
+                                                                   io_rule_applied   IN OUT VARCHAR2,     -- Check this value if previous rule applied
+                                                                   -- Precendence of procedure/event calls will have to be looked at
+                                                                   -- for this to work
+                                                                   i_ctm_sysout      IN     VARCHAR2)
+AS
+   -- ***************************************************************************************
+   -- *  Check rules and create event if needed
+   -- *
+   -- *  Event Name: BROADBAND_TRANSFER_AWAY
+   -- ***************************************************************************************
+   -- Version  Date         Who            Comment
+   -- 1.00     03-AUG-2014  David Erskine  Created
+   -- 1.01     16-JAN-2017  Kelly Ji       (MTMI-523/525)
+   --                                      Update existing PSTN/ADSL version to also send on components: 991026, 991158, 991159, 991160? (ie om_service_type_vw_s)
+   --                                      Ignores disconnections done by via collections process (determined in calling procedure HSTT_ORD_SO_EXT_DATA_SCAN).
+   --                                      Disconnection orders where the disconnection was processed by the system and not a user
+   --                                      Do not send NBN_BB_DISCO communciation (hstt_rule_nbn_bb_disco) if this communication is sent. (Business rule applied in hstt_rule_nbn_bb_disco)
+   -- ***************************************************************************************
+
+   l_rule    CONSTANT VARCHAR2 (30) := 'BROADBAND_TRANSFER_AWAY';
+   l_trnfr_cnt        NUMBER;
+   l_id               NUMBER;
+   l_comm_ord_xml     VARCHAR2 (4000);
+   l_scan_proc_name   VARCHAR2 (50);
+   l_processor_id     NUMBER;
+
+   l_error_msg        VARCHAR2 (1000);
+   row_error          EXCEPTION;
+   PRAGMA EXCEPTION_INIT (row_error, -20001);
+-- select * from arbor.generic_enumeration_values where enumeration_key = 'TW_Request_Type'
+-- 1   Port
+-- 2   Transfer
+-- 3   New Service
+-- 4   Disconnect
+-- 5   Slam Reversal
+-- 6   Held Complete
+-- 7   Change of Lessee
+-- 8   Transfer from SSS
+-- 9   Moving Home
+-- 10  Off Record Received
+-- 11  Pre Transition
+-- 12  Transition
+-- 13  DSL Transition Disconnect
+-- 14  Churn in Transition
+-- 15  NBN Transfer
+-- 16  ULL Transition
+
+BEGIN
+   IF     i_rec_h.param_value = 'Completed'                                                                                                  -- insert
+      AND (i_rec_ded.param_value <> 'Completed' OR i_rec_ded.param_value IS NULL)                                                            -- delete
+      AND i_rec_so.service_order_type_id = 50                                                                                            -- disconnect
+      AND i_rec_so.emf_config_id = 13                                                                               -- internet (om_service_type_vw_s)
+      AND i_rec_so.create_who NOT IN ('disconnectuser', 'raruser')                                                         -- processed via the system
+   THEN
+      SELECT COUNT (1)
+        INTO l_trnfr_cnt
+        FROM hstt_data_gt cdg
+       WHERE     cdg.data_key_1 = 'ORD_SERVICE_ORDER_EXT_DATA'
+             AND cdg.data_key_2 = '9020'                                                                                     -- 9020 = tw_request_type
+             AND cdg.data_value = '2'
+             AND NOT EXISTS
+                    (SELECT *
+                       FROM arbor.ord_service_order
+                      WHERE order_id = i_rec_so.order_id AND emf_config_id = 14);
+
+      IF l_trnfr_cnt > 0
+      THEN
+         -- Get the default XML for BSE communication
+         BEGIN
+            l_comm_ord_xml := i_system_token ('BSE_CALL-COMM_ORDER_XML');
+         EXCEPTION
+            WHEN OTHERS
+            THEN
+               raise_application_error (-20001, 'BSE_CALL-COMM_ORDER_XML token issue');
+         END;
+
+         -- Get scan procedure name
+         BEGIN
+            l_scan_proc_name := i_system_token ('SCAN_PROC_NAME');
+         EXCEPTION
+            WHEN OTHERS
+            THEN
+               raise_application_error (-20001, 'SCAN_PROC_NAME token issue');
+         END;
+
+         -- Get processor
+         BEGIN
+            l_processor_id := i_system_token ('PROCESSOR_ID-' || l_scan_proc_name || '-ST-' || l_rule);
+         EXCEPTION
+            WHEN OTHERS
+            THEN
+               raise_application_error (-20001, 'PROCESSOR_ID-' || l_scan_proc_name || '-ST-' || l_rule || ' token issue');
+         END;
+
+
+         SELECT hstt_event_seq.NEXTVAL INTO l_id FROM DUAL;
+
+         l_comm_ord_xml := REPLACE (l_comm_ord_xml, '<ExternalID></ExternalID>', '<ExternalID>' || l_id || '</ExternalID>');
+         l_comm_ord_xml := REPLACE (l_comm_ord_xml, '<AccountInternalId></AccountInternalId>', '<AccountInternalId>' || i_rec_so.account_no || '</AccountInternalId>');
+         l_comm_ord_xml := REPLACE (l_comm_ord_xml, '<OrderId></OrderId>', '<OrderId>' || i_rec_so.order_id || '</OrderId>');
+         l_comm_ord_xml := REPLACE (l_comm_ord_xml, '<ServiceOrderId></ServiceOrderId>', '<ServiceOrderId>' || i_rec_h.service_order_id || '</ServiceOrderId>');
+         l_comm_ord_xml := REPLACE (l_comm_ord_xml, '<CommunicationEvent></CommunicationEvent>', '<CommunicationEvent>' || l_rule || '</CommunicationEvent>');
+         l_comm_ord_xml := REPLACE (l_comm_ord_xml, '<Parameter></Parameter>');
+
+         INSERT INTO hstt_event (event_id,
+                                 proc_name,
+                                 hst_id,
+                                 rule_name,
+                                 event_type,
+                                 account_no,
+                                 order_id,
+                                 service_order_id,
+                                 event_detail,
+                                 date_create,
+                                 date_last_updated,
+                                 ctm_sysout_scan)
+              VALUES (l_id,
+                      l_scan_proc_name,
+                      i_rec_h.hst_id,
+                      l_rule,
+                      'BSE_CALL_' || l_processor_id,
+                      i_rec_so.account_no,
+                      i_rec_so.order_id,
+                      i_rec_h.service_order_id,
+                      l_comm_ord_xml,
+                      SYSDATE,
+                      SYSDATE,
+                      i_ctm_sysout);
+
+         io_rule_applied := io_rule_applied || l_rule || '|';
+      END IF;
+   END IF;
+EXCEPTION
+   WHEN row_error
+   THEN
+      -- Row error
+      l_error_msg := l_rule || ' - ' || SUBSTR (SQLERRM, 12, 950);
+      raise_application_error (-20001, l_error_msg);
+   WHEN OTHERS
+   THEN
+      -- Unhandled error
+      l_error_msg := l_rule || ' - ' || SUBSTR (SQLERRM, 1, 950);
+      raise_application_error (-20002, l_error_msg);
+END;
+
+--------------------------------------------HSTT_WS_TRN_UPDATE  --------------------------
+
+create or replace PROCEDURE        HSTT_WS_TRN_UPDATE (
+      v_error_flag   OUT pls_integer)
+AS
+   -- ***************************************************************************************
+   -- *  Logs TRN to HSTT_WS_TRN_UPDATE if doesnt already exist
+   -- *
+   -- *  Version 1.00
+   -- ***************************************************************************************
+   -- Version  Date         Who            Comment
+   -- 1.00     11/03/2017  Manjeet Kumar  Created for NCP Polling
+    -- This procedure will be called from web service and it will check the foxtel.hstt_trn_status table with supplied TRN and if TRN not available in this table then a new records will be inserted else only last notification will be updated.
+   -- ***************************************************************************************
+    v_all_records_available   NUMBER (1);
+BEGIN
+   v_error_flag := 0;
+   v_all_records_available := 0;
+
+    -- Check that if all the TRN available in foxtel.hstt_trn_status then update the last notifictaion column else use merge the same.  
+    
+   SELECT CASE
+             WHEN EXISTS
+                     (SELECT 1
+                        FROM foxtel.gtemp_trn_no tmp
+                       WHERE NOT EXISTS
+                                (SELECT 1
+                                 FROM foxtel.hstt_trn_status hs
+                                  WHERE hs.trn = tmp.trn_no))
+             THEN
+                1
+             ELSE
+                0
+          END
+     INTO v_all_records_available
+     FROM DUAL;
+--    DBMS_OUTPUT.PUT_LINE ('First ststement executed');    
+    --CREATE global TEMPORARY TABLE foxtel.gtbl_trn_odr_srv_ordr(service_order_id number(18),order_id number(18),trn_no varchar2(15)) ON COMMIT DELETE ROWS
+    
+   IF v_all_records_available = 1
+   THEN
+    insert into foxtel.gtbl_trn_odr_srv_ordr(service_order_id,order_id,trn_no)
+      SELECT SERVICE_ORDER_ID, ORDER_ID, trn_no      
+        FROM (SELECT ST.SERVICE_ORDER_ID,
+                     (SELECT SO.ORDER_ID
+                      FROM arbor.ord_service_order so
+                       WHERE SO.SERVICE_ORDER_ID = ST.SERVICE_ORDER_ID)
+                        AS ORDER_ID,
+                     st.param_value trn_no
+      FROM arbor.ord_service_order_ext_data st
+               WHERE param_id = 9016                                     --TRN
+                     AND param_value IN (SELECT  tmp.trn_no
+                                           FROM foxtel.gtemp_trn_no tmp));
+
+    MERGE INTO foxtel.hstt_trn_status hts 
+           USING (SELECT SERVICE_ORDER_ID, ORDER_ID, trn_no
+                    FROM foxtel.gtbl_trn_odr_srv_ordr) tmp
+              ON (hts.service_order_id = tmp.SERVICE_ORDER_ID)
+      WHEN MATCHED
+      THEN
+         UPDATE SET hts.last_tw_notification = SYSDATE
+      WHEN NOT MATCHED
+      THEN
+         INSERT     (service_order_id,
+                     trn,
+                     status,
+                     status_reason,
+                     status_updated,
+                     last_checked,
+                     date_created,
+                     order_id,
+                     LAST_TW_NOTIFICATION)
+             VALUES (tmp.service_order_id,
+                     tmp.trn_no,
+                     'OPEN',
+                     NULL,
+                     SYSDATE,
+                     SYSDATE,
+                     SYSDATE,
+                     tmp.ORDER_ID,
+                     SYSDATE);
+   ELSE
+    UPDATE foxtel.hstt_trn_status hstt
+         SET hstt.last_tw_notification = SYSDATE
+       WHERE hstt.trn IN (SELECT  tmp.trn_no
+                             FROM foxtel.gtemp_trn_no tmp);                            
+                        
+   END IF;
+
+EXCEPTION
+   WHEN OTHERS
+   THEN
+      v_error_flag :=  1;
+END;
+
+
+
+
+---------------------------------------------HSTT_TRN_STATUS_SCAN  ----------------------
+
+create or replace PROCEDURE        HSTT_TRN_STATUS_SCAN (i_ctm_sysout IN VARCHAR2, i_logging_flag IN NUMBER, i_reconcile IN NUMBER)
+AS
+   -- ***************************************************************************************
+   -- * Process TRN status rows
+   -- *
+   -- ***************************************************************************************
+   -- Version  Date         Who            Jira         Comment
+   -- 1.00     19-JUL-2015  David Erskine               Created
+   -- 1.01     31-MAY-2016  David Erskine  ED-334       added last KMI date
+   -- 1.02     20-JUL-2016  David Erskine  ED-334       added NBN details
+   -- 1.03     12-SEP-2016  Colin Ward     ED-1267      Add Status Code and Service Type to table
+   -- 1.04     23-SEP-2016  Colin Ward     ED-1267      Set Service Type only if NULL
+   -- 1.05     08-JUN-2017  Kelly JI       MTMI-1976    Change to: TCD is null or today or tomorrow or status is Held
+   -- 1.06     23-JUN-2017  Kelly JI       MTMI-2088    Adjustment of low-frequency NBN Polling start time
+   --1.07      28-Nov-2017 Manjeet Kumar  MTMI-2302  Required to support CR509 TW (Telstra Wholesale) API enhancement for NBN polling process
+
+   -- ***************************************************************************************
+
+   CURSOR get_st (
+      c_scan_proc_name    VARCHAR2)
+   IS
+      SELECT st.*
+        FROM foxtel.hstt_scan_system_token sst
+             INNER JOIN foxtel.hstt_system_token st
+                ON sst.scan_proc_name = c_scan_proc_name AND sst.token_type = st.token_type AND sst.token_name = st.token_name
+      UNION
+      SELECT *
+        FROM hstt_system_token st2
+       WHERE st2.token_name LIKE c_scan_proc_name || '-ST-%';
+
+   CURSOR get_t
+   IS
+        SELECT oso.account_no,
+               oso.order_id,
+               hts.service_order_id,
+               hts.trn,
+               hts.last_checked,
+               hts.last_sent_date,
+               hts.last_kmi_date,
+               hts.event_id,
+               oso.order_status_id,
+               oso.service_order_type_id,
+               hts.trn || '|' || oso.order_id upd_key,
+               MAX (CASE WHEN osoed.param_id = 9016 THEN osoed.param_value ELSE NULL END) has_trn,
+               MAX (CASE WHEN osoed.param_id = 9018 THEN osoed.param_value ELSE NULL END) tcd,
+               MAX (CASE WHEN osoed.param_id = 9019 THEN osoed.param_value ELSE NULL END) tw_req_status,
+               MAX (CASE WHEN osoed.param_id = 9020 THEN osoed.param_value ELSE NULL END) tw_req_type,
+               MAX (CASE WHEN osoed.param_id = 10051 THEN osoed.param_value ELSE NULL END) nbn_req_status,
+               MAX (CASE WHEN stc.service_group IN ('INTERNET', 'PHONE') AND stc.service_code = 'NBN' THEN 1 ELSE 0 END) nbn_service,
+               MAX (
+                  CASE
+                     WHEN oso.service_order_type_id = 20 AND oi.item_action_id = 10 AND oi.member_type = 20 AND oi.member_id = 14421 THEN 1
+                     ELSE 0
+                  END)
+                  has_dsl_disc_nrc,
+               MAX (
+                  CASE
+                     WHEN oso.service_order_type_id = 20 AND oi.item_action_id = 20 AND oi.member_type = 10 AND oi.member_id = 202728 THEN 1
+                     ELSE 0
+                  END)
+                  has_call_cntrl,
+                  HTS.LAST_TW_NOTIFICATION
+          FROM foxtel.hstt_trn_status hts
+               LEFT JOIN arbor.ord_service_order_ext_data osoed
+                  ON     hts.service_order_id = osoed.service_order_id
+                     AND osoed.param_id IN (9016,
+                                            9018,
+                                            9019,
+                                            9020,
+                                            10051)
+               LEFT JOIN arbor.ord_service_order oso ON hts.service_order_id = oso.service_order_id
+               LEFT JOIN arbor.cmf_package_component cpc
+                  ON     oso.subscr_no = cpc.parent_subscr_no
+                     AND oso.subscr_no_resets = cpc.parent_subscr_no_resets
+                     AND SYSDATE < COALESCE (cpc.inactive_dt, SYSDATE + 1)
+                     AND cpc.active_dt <> COALESCE (cpc.inactive_dt, cpc.active_dt + 1)                                      -- future dated cancelled
+               LEFT JOIN foxtel.om_service_type_vw_s stc ON oso.emf_config_id = stc.emf_config_id AND cpc.component_id = stc.component_id
+               LEFT JOIN arbor.ord_item oi ON oso.service_order_id = oi.service_order_id AND oi.is_cancelled = 0
+         WHERE hts.status = 'OPEN' 
+      GROUP BY oso.account_no,
+               oso.order_id,
+               hts.service_order_id,
+               hts.trn,
+               hts.last_checked,
+               hts.last_sent_date,
+               hts.last_kmi_date,
+               hts.event_id,
+               oso.order_status_id,
+               oso.service_order_type_id,
+               HTS.LAST_TW_NOTIFICATION
+      ORDER BY oso.order_id, hts.trn;
+      
+   l_scan_proc_name   VARCHAR2 (100) := 'HSTT_TRN_STATUS_SCAN';
+   l_system_token     hstt_pkg.vchr2_vchr2;
+   l_processor_id     NUMBER;
+   l_status           hstt_trn_status.status%TYPE;
+   l_status_code      hstt_trn_status.status_code%TYPE;
+   l_status_reason    hstt_trn_status.status_reason%TYPE;
+   l_date             DATE;
+   l_last_chk_date    DATE;
+   l_skip_key         VARCHAR2 (4000);
+   l_id               NUMBER;
+   l_xml              VARCHAR2 (4000);
+   l_poll_xml         VARCHAR2 (4000);
+   l_commit_cnt       NUMBER := 0;
+   l_so_id            NUMBER := 0;
+   l_severity         NUMBER;
+   l_message          VARCHAR2 (4000);
+   l_success_flag     VARCHAR2 (10);
+   l_send             NUMBER;
+    l_last_checked_config_value number;
+   l_last_checked DATE;
+   l_time_from VARCHAR2(10);
+   l_time_to VARCHAR2(10);
+   l_polling_event varchar2(5);
+   l_legacy_polling_flag varchar2(5);
+   l_error_msg        VARCHAR2 (1000);
+BEGIN
+   hstt_add_log (i_ctm_sysout,
+                 'LOG',
+                 'START',
+                 NULL,
+                 l_scan_proc_name,
+                 1,
+                 1,
+                 i_logging_flag);
+   hstt_add_log (i_ctm_sysout,
+                 'LOG',
+                 'RECONCILE = ' || i_reconcile,
+                 NULL,
+                 l_scan_proc_name,
+                 1,
+                 1,
+                 i_logging_flag);
+
+SELECT last_checked ,
+            time_from,
+            time_to,
+            legacy_polling_flag  INTO l_last_checked_config_value,
+              l_time_from,
+              l_time_to,
+               l_legacy_polling_flag
+  FROM (SELECT MAX (last_checked) last_checked,
+               MAX (time_from) time_from,
+               MAX (time_to) time_to,
+               max(legacy_polling_flag) legacy_polling_flag    
+          FROM (SELECT CASE
+                          WHEN token_name =
+                                  'HSTT_TRN_STATUS_SCAN-LAST-CHECKED'
+                          THEN
+                             token_value
+                          ELSE
+                             NULL
+                       END
+                          last_checked,
+                       CASE
+                          WHEN token_name = 'HSTT_TRN_STATUS_SCAN-TIME-FROM'
+                          THEN
+                             token_value
+                          ELSE
+                             NULL
+                       END
+                          time_from,
+                       CASE
+                          WHEN token_name = 'HSTT_TRN_STATUS_SCAN-TIME-TO'
+                          THEN
+                             token_value
+                          ELSE
+                             NULL
+                       END
+                          time_to,
+                        CASE
+                          WHEN token_name = 'HSTT_TRN_STATUS_SCAN-LEGACY-POLLING-FLAG'
+                          THEN
+                             token_value
+                          ELSE
+                             NULL
+                       END legacy_polling_flag
+                  FROM FOXTEL.HSTT_SYSTEM_TOKEN tkn
+                 WHERE TKN.TOKEN_TYPE = 'PROCESSOR_ID'
+                       AND TKN.TOKEN_NAME IN
+                              ('HSTT_TRN_STATUS_SCAN-LAST-CHECKED',
+                               'HSTT_TRN_STATUS_SCAN-TIME-FROM',
+                               'HSTT_TRN_STATUS_SCAN-TIME-TO',
+                                'HSTT_TRN_STATUS_SCAN-LEGACY-POLLING-FLAG')));  
+                                
+                l_last_checked := (sysdate - (1/l_last_checked_config_value));           
+                
+   -- Run reconcile
+   IF i_reconcile = 1
+   THEN
+      l_date := SYSDATE;
+      l_last_chk_date := SYSDATE - 1.01;                                                                                     -- goes in to check below
+
+      -- should be clear, but...
+      DELETE FROM foxtel.hstt_temp_gt;
+
+      -- get all active orders that are for phone or internet
+      INSERT /*+ append */
+            INTO  foxtel.hstt_temp_gt (id_1, id_2)
+         SELECT /*+ PARALLEL */
+               oso.service_order_id, oso.order_id
+           FROM arbor.ord_service_order oso
+          WHERE     oso.order_status_id NOT IN (80, 86, 90)
+                -- keep as full table scan for run time consistency
+                AND oso.emf_config_id + 0 IN (SELECT st.emf_config_id
+                                                FROM om_service_type_vw_s st
+                                               WHERE st.service_group IN ('INTERNET', 'PHONE'));
+
+      COMMIT;
+
+      hstt_add_log (i_ctm_sysout,
+                    'LOG',
+                    'Finished gathering open orders',
+                    NULL,
+                    l_scan_proc_name,
+                    1,
+                    1,
+                    i_logging_flag);
+
+      MERGE INTO foxtel.hstt_trn_status hts
+           USING (  SELECT htg.service_order_id, htg.order_id, MAX (CASE WHEN osoed.param_id = 9016 THEN osoed.param_value ELSE NULL END) trn
+                      FROM (SELECT id_1 service_order_id, id_2 order_id FROM hstt_temp_gt) htg
+                           INNER JOIN arbor.ord_service_order_ext_data osoed
+                              ON htg.service_order_id = osoed.service_order_id AND osoed.param_id + 0 = 9016
+                           LEFT JOIN hstt_trn_status hts ON osoed.service_order_id = hts.service_order_id
+                     WHERE hts.service_order_id IS NULL OR (osoed.param_value <> hts.trn AND hts.trn IS NOT NULL)
+                  GROUP BY htg.service_order_id, htg.order_id) tmp
+              ON (hts.service_order_id = tmp.service_order_id)
+      WHEN MATCHED
+      THEN
+         UPDATE SET hts.trn = tmp.trn,
+                    hts.status = 'OPEN',
+                    hts.status_code = NULL,
+                    hts.status_reason = NULL,
+                    hts.status_updated = l_date,
+                    hts.last_checked = l_last_chk_date,
+                    hts.reconcile_operation = 'UPDATE',
+                    hts.last_kmi_date = NULL
+      WHEN NOT MATCHED
+      THEN
+         INSERT     (service_order_id,
+                     trn,
+                     status,
+                     status_code,
+                     status_reason,
+                     status_updated,
+                     last_checked,
+                     date_created,
+                     reconcile_operation,
+                     order_id,
+                     last_kmi_date,
+                     service_type)
+             VALUES (tmp.service_order_id,
+                     tmp.trn,
+                     'OPEN',
+                     NULL,
+                     NULL,
+                     l_date,
+                     l_last_chk_date,
+                     l_date,
+                     'INSERT',
+                     tmp.order_id,
+                     NULL,
+                     NULL);
+
+      COMMIT;
+
+      hstt_add_log (i_ctm_sysout,
+                    'LOG',
+                    'Finished reconcile',
+                    NULL,
+                    l_scan_proc_name,
+                    1,
+                    1,
+                    i_logging_flag);
+   ELSE
+      -- Check via BSE if Telstra is in planned or unplanned outage
+      BEGIN
+         s_bse_pi_process_system_alerts ('BSE_TELSTRA_NBN_OUTAGE',
+                                         0,
+                                         l_severity,
+                                         l_message);
+      EXCEPTION
+         WHEN OTHERS
+         THEN
+            l_error_msg := SUBSTR (SQLERRM, 1, 500);
+            raise_application_error (-20001, 'Unable to check for Telstra Outage in BSE. Process stopped ERROR[ ' || l_error_msg || ']');
+      END;
+
+      IF l_severity > 0
+      THEN
+         -- If greater then zero then Telstra in outage.
+
+         hstt_add_log (i_ctm_sysout,
+                       'LOG',
+                       'Telstra in outage no processing attempted',
+                       NULL,
+                       l_scan_proc_name,
+                       1,
+                       1,
+                       i_logging_flag);
+      ELSIF l_severity = 0
+      THEN
+         -- Get array of system tokens
+         FOR rec_st IN get_st (l_scan_proc_name)
+         LOOP
+            l_system_token (rec_st.token_type || '-' || rec_st.token_name) := rec_st.token_value;
+            hstt_add_log (i_ctm_sysout,
+                          'LOG',
+                          'TOKEN: ' || SUBSTR (rec_st.token_type || '-' || rec_st.token_name || ' - ' || rec_st.token_value, 1, 4000),
+                          NULL,
+                          l_scan_proc_name,
+                          1,
+                          1,
+                          i_logging_flag);
+         END LOOP;
+
+         -- Get processor id
+         BEGIN
+            l_processor_id := l_system_token ('PROCESSOR_ID-' || l_scan_proc_name || '-ST-MAIN');
+         EXCEPTION
+            WHEN OTHERS
+            THEN
+               raise_application_error (-20001, 'PROCESSOR_ID-' || l_scan_proc_name || '-ST token issue');
+         END;
+
+         --#############
+         -- Testing
+         --#############
+         --l_processor_id := 99;
+
+         -- Get the default XML for BSE communication
+         BEGIN
+            l_xml := l_system_token ('BSE_CALL-NBN_POLLING_XML');
+         EXCEPTION
+            WHEN OTHERS
+            THEN
+               raise_application_error (-20001, 'BSE_CALL-NBN_POLLING_XML token issue');
+         END;
+
+         l_skip_key := '|';
+
+         -- update last checked with succesful BSE calls
+         UPDATE hstt_trn_status hts
+            SET hts.last_checked = hts.last_sent_date
+          WHERE hts.service_order_id IN (SELECT hts2.service_order_id
+                                           FROM hstt_trn_status hts2
+                                                INNER JOIN s_auditlog al
+                                                   ON     al.methodname = 'WebService.NBNPollingUpdate'
+                                                      AND al.username = 'TRN Scanner'
+                                                      AND al.applicationname = 'NBN Polling TRN Scan'
+                                                      AND al.operatorname = 'pollinguser'
+                                                      AND al.orderid = TO_CHAR (hts2.order_id)
+                                                      AND al.externalid = TO_CHAR (hts2.event_id)
+                                          --and al.errordescription is null
+                                          WHERE hts2.status = 'OPEN' AND hts2.last_checked <> COALESCE (hts2.last_sent_date, hts2.last_checked));
+
+         FOR rec_t IN get_t
+         LOOP
+            l_so_id := rec_t.service_order_id;
+
+            l_status := NULL;
+
+            IF rec_t.order_status_id IN (80, 86, 90)
+            THEN
+               l_status := 'DONE';
+               l_status_code := 'SO_CMPLCNX';
+               l_status_reason := 'Service order has been cancelled or completed';
+            ELSIF rec_t.has_trn IS NULL
+            THEN
+               l_status := 'DONE';
+               l_status_code := 'TRN_RMVCHG';
+               l_status_reason := 'TRN has been removed or changed';
+            ELSIF rec_t.tw_req_status IN ('Completed',
+                                          'Withdrawn',
+                                          'Unable to Complete',
+                                          'Unable to Process')
+            THEN
+               l_status := 'DONE';
+               l_status_code := 'TWRS_TERM';
+               l_status_reason := 'Service TW request status has been set to a terminal status';
+            ELSIF rec_t.nbn_service = 0 AND (CASE WHEN rec_t.service_order_type_id = 50 AND rec_t.tw_req_type = '12' THEN 1 ELSE 0 END = 0)
+            THEN
+               l_status := 'DONE';
+               l_status_code := 'SO_NOTNBN';
+               l_status_reason := 'Service does not contain a NBN component and is not a transition';
+            ELSIF rec_t.has_dsl_disc_nrc = 1
+            THEN
+               l_status := 'DONE';
+               l_status_code := 'SO_DISCO';
+               l_status_reason := 'Service order has DSL disconnect NRC';
+            ELSIF rec_t.has_call_cntrl = 1
+            THEN
+               l_status := 'DONE';
+               l_status_code := 'SO_CC';
+               l_status_reason := 'Service order has Call Control RC';
+            END IF;
+
+            IF l_status IS NOT NULL
+            THEN
+               -- update TRN status
+               UPDATE hstt_trn_status hts
+                  SET hts.status = l_status,
+                      hts.status_code = l_status_code,
+                      hts.status_reason = l_status_reason,
+                      hts.status_updated = SYSDATE,
+                      hts.last_checked = SYSDATE,
+                      hts.service_type = COALESCE (hts.service_type, CASE WHEN rec_t.nbn_service = 0 THEN 'PSTN' ELSE 'NBN' END)
+                WHERE hts.service_order_id = rec_t.service_order_id;
+            ELSE
+               -- only do for first order
+               IF l_skip_key <> rec_t.trn || '|' || rec_t.order_id
+               THEN
+                  -- if sent and not in auditlog and last tried less than a hour ago dont send
+                  IF rec_t.last_sent_date > rec_t.last_checked AND rec_t.last_sent_date >= SYSDATE - 1 / 24 AND rec_t.last_sent_date IS NOT NULL
+                  THEN
+                     l_send := 0;
+                  ELSE
+                     l_send := 1;
+                  END IF;
+                     l_polling_event :='FALSE';
+                     IF     l_send = 1 and l_legacy_polling_flag ='TRUE' then
+                                          
+                         If (   (rec_t.last_checked < l_last_checked AND TO_CHAR (SYSDATE, 'HH24:MI') BETWEEN l_time_from AND l_time_to)                         -- MTMI-2088
+                          OR rec_t.tcd IS NULL
+                          OR rec_t.tw_req_status = 'Held'
+                          OR SUBSTR (rec_t.tcd, 1, 10) IN (TO_CHAR (TRUNC (SYSDATE), 'YYYY-MM-DD'), TO_CHAR (TRUNC (SYSDATE + 1), 'YYYY-MM-DD'))
+                          OR (SUBSTR (rec_t.tcd, 1, 10) < TO_CHAR (TRUNC (SYSDATE), 'YYYY-MM-DD') AND rec_t.tw_req_status = 'Inprogress')
+                          OR rec_t.nbn_req_status IN ('Held', 'Reschedule Required')) then 
+                                                   l_polling_event := 'TRUE';
+                           end if;
+                       elsif l_send = 1 and l_legacy_polling_flag ='FALSE' then
+                          if   (   (rec_t.last_checked < rec_t.last_tw_notification)
+                                OR (   (rec_t.last_checked < l_last_checked AND TO_CHAR (SYSDATE, 'HH24:MI') BETWEEN l_time_from AND l_time_to)
+                                          AND ( rec_t.tcd IS NULL
+                                                   OR rec_t.tw_req_status = 'Held'
+                                                   OR SUBSTR (rec_t.tcd, 1, 10) IN (TO_CHAR (TRUNC (SYSDATE), 'YYYY-MM-DD'), TO_CHAR (TRUNC (SYSDATE + 1), 'YYYY-MM-DD'))
+                                                   OR (SUBSTR (rec_t.tcd, 1, 10) < TO_CHAR (TRUNC (SYSDATE), 'YYYY-MM-DD'))
+                                                   OR rec_t.nbn_req_status IN ('Held', 'Reschedule Required')))) then                          
+                               l_polling_event := 'TRUE';                               
+                            end if;
+                     end if;
+                   
+               IF     l_send = 1   AND   l_polling_event = 'TRUE'
+                  THEN
+                     l_poll_xml := l_xml;
+
+                     SELECT hstt_event_seq.NEXTVAL INTO l_id FROM DUAL;
+
+                     l_poll_xml := REPLACE (l_poll_xml, '<ExternalId></ExternalId>', '<ExternalId>' || l_id || '</ExternalId>');
+                     l_poll_xml :=
+                        REPLACE (l_poll_xml,
+                                 '<AccountInternalId></AccountInternalId>',
+                                 '<AccountInternalId>' || rec_t.account_no || '</AccountInternalId>');
+                     l_poll_xml := REPLACE (l_poll_xml, '<OrderId></OrderId>', '<OrderId>' || rec_t.order_id || '</OrderId>');
+                     l_poll_xml :=
+                        REPLACE (l_poll_xml,
+                                 '<TelstraReferenceNumber></TelstraReferenceNumber>',
+                                 '<TelstraReferenceNumber>' || rec_t.trn || '</TelstraReferenceNumber>');
+
+                     IF rec_t.last_kmi_date IS NOT NULL
+                     THEN
+                        l_poll_xml :=
+                           REPLACE (
+                              l_poll_xml,
+                              '<LastKMIActivityTime></LastKMIActivityTime>',
+                                 '<LastKMIActivityTime>'
+                              || TO_CHAR (rec_t.last_kmi_date, 'YYYY-MM-DD')
+                              || 'T'
+                              || TO_CHAR (rec_t.last_kmi_date, 'HH24:MI:SS')
+                              || '</LastKMIActivityTime>');
+                     END IF;
+
+                     -- send to BSE
+                     INSERT INTO hstt_event (event_id,
+                                             proc_name,
+                                             hst_id,
+                                             rule_name,
+                                             event_type,
+                                             account_no,
+                                             order_id,
+                                             service_order_id,
+                                             event_detail,
+                                             date_create,
+                                             date_last_updated,
+                                             ctm_sysout_scan)
+                          VALUES (l_id,
+                                  l_scan_proc_name,
+                                  rec_t.service_order_id,
+                                  'TRN_STATUS_SCAN',
+                                  'BSE_CALL_' || l_processor_id,
+                                  rec_t.account_no,
+                                  rec_t.order_id,
+                                  NULL,
+                                  l_poll_xml,
+                                  SYSDATE,
+                                  SYSDATE,
+                                  i_ctm_sysout);
+
+                     UPDATE hstt_trn_status hts
+                        SET hts.last_sent_date = SYSDATE,
+                            --hts.last_checked = l_last_chk_date,
+                            hts.event_id = l_id,
+                            hts.service_type = COALESCE (hts.service_type, CASE WHEN rec_t.nbn_service = 0 THEN 'PSTN' ELSE 'NBN' END)
+                      WHERE hts.order_id = rec_t.order_id AND hts.trn = rec_t.trn;
+                  END IF;
+
+                  l_skip_key := rec_t.trn || '|' || rec_t.order_id;
+               END IF;
+            END IF;
+
+            IF l_commit_cnt = 100
+            THEN
+               COMMIT;
+               l_commit_cnt := 0;
+            END IF;
+
+            l_commit_cnt := l_commit_cnt + 1;
+         END LOOP;
+
+         COMMIT;
+         hstt_add_log (i_ctm_sysout,
+                       'LOG',
+                       'Finished event creation',
+                       NULL,
+                       l_scan_proc_name,
+                       1,
+                       1,
+                       i_logging_flag);
+
+         -- update all open orders with there max last check date
+         MERGE INTO hstt_trn_status hts
+              USING (  SELECT hts2.order_id, MAX (hts2.last_checked) max_last_checked
+                         FROM hstt_trn_status hts2
+                        WHERE hts2.status = 'OPEN'
+                     GROUP BY hts2.order_id) tmp
+                 ON (tmp.order_id = hts.order_id AND hts.status = 'OPEN')
+         WHEN MATCHED
+         THEN
+            UPDATE SET hts.last_checked = tmp.max_last_checked;
+      END IF;
+   END IF;
+
+   hstt_add_log (i_ctm_sysout,
+                 'LOG',
+                 'END',
+                 NULL,
+                 l_scan_proc_name,
+                 1,
+                 1,
+                 i_logging_flag);
+
+   COMMIT;
+EXCEPTION
+   WHEN OTHERS
+   THEN
+      ROLLBACK;
+      l_error_msg := SUBSTR (SQLERRM || ' - ' || DBMS_UTILITY.format_error_backtrace, 1, 1000);
+      raise_application_error (-20002, 'Error [Service Order Id ' || TO_CHAR (l_so_id) || '] ' || l_error_msg);
+END;
+
+
+
+-----------------------HSTT_RULE_TRN_STATUS --------------------
+
+create or replace PROCEDURE        HSTT_RULE_TRN_STATUS
+(
+    i_rec_h             in     HSTT_PKG.r_hst_ord_so_ext_data%rowtype,
+    i_rec_so            in     arbor.ord_service_order%rowtype,
+    i_rec_ded           in     hst_ord_so_ext_data%rowtype,
+    i_system_token      in     hstt_pkg.vchr2_vchr2,
+    io_rule_applied     in out varchar2, -- Check this value if previous rule applied
+                                         -- Precendence of procedure/event calls will have to be looked at
+                                         -- for this to work
+    i_ctm_sysout        in     varchar2
+) as
+-- ***************************************************************************************
+-- *  Logs TRN to HSTT_TRN_STATUS if doesnt already exist
+-- *
+-- *  Version 1.00
+-- ***************************************************************************************
+-- Version  Date         Who            Comment
+-- 1.00     18-JUL-2015  David Erskine  Created for TCR265
+-- ***************************************************************************************
+
+
+    l_rule                  varchar2(50) := 'TRN_STATUS';
+    l_scan_proc_name        varchar2(50);
+    l_processor_id          number;
+    l_cnt                   number;
+    l_error_msg             varchar2(1000);
+
+begin
+
+    if i_rec_h.param_value is not null -- has insert
+       and (i_rec_ded.param_value is null or i_rec_h.param_value <> i_rec_ded.param_value) then -- is TRN new or changed
+
+
+
+        merge into hstt_trn_status hts
+             using ( select i_rec_h.service_order_id service_order_id from dual ) tmp
+                on ( hts.service_order_id = tmp.service_order_id )
+              when matched then update set hts.trn = i_rec_h.param_value,
+                                           hts.status = 'OPEN',
+                                           hts.status_updated = sysdate,
+                                           hts.last_checked = sysdate
+              when not matched then insert ( service_order_id,
+                                             trn,
+                                             status,
+                                             status_reason,
+                                             status_updated,
+                                             last_checked,
+                                             date_created,
+                                             order_id )
+                                    values ( i_rec_h.service_order_id,
+                                             i_rec_h.param_value,
+                                             'OPEN',
+                                             null,
+                                             sysdate,
+                                             sysdate,
+                                             sysdate,
+                                             i_rec_so.order_id );
+
+        io_rule_applied := io_rule_applied || l_rule || '|';
+
+    end if;
+
+exception
+    when others then
+
+        -- Unhandled error
+        l_error_msg := l_rule || ' - ' || substr(sqlerrm,1,950);
+        raise_application_error ( -20002, l_error_msg );
+
+end;
+
+--------------------- HSTT_TRN_STATUS_TRG1 -----------------------------------------------
+
+create or replace TRIGGER FOXTEL.HSTT_TRN_STATUS_TRG1
+AFTER UPDATE
+ON FOXTEL.HSTT_TRN_STATUS
+REFERENCING NEW AS new OLD AS old
+FOR EACH ROW
+DECLARE
+-- ***************************************************************************************
+-- *  Log changes to table
+-- *
+-- *  Version 1.01
+-- ***************************************************************************************
+-- Version  Date         Who            Comment
+-- 1.00     12-AUG-2015  David Erskine  Created
+-- 1.01     31-MAY-2016     David Erskine  ED-334 - update for KMI date
+-- ***************************************************************************************
+BEGIN
+
+    -- need because merge both insert and update
+    if ( :old.status = 'DONE' and :new.status = 'OPEN' ) or ( :old.trn <> :new.trn ) then
+
+        insert into hstt_trn_status_log ( service_order_id,
+                                          trn,
+                                          status,
+                                          status_reason,
+                                          status_updated,
+                                          last_checked,
+                                          date_created,
+                                          reconcile_operation,
+                                          order_id,
+                                          last_kmi_date,
+                                          last_sent_date,
+                                          event_id,
+                                          service_type,
+                                          status_code
+                                          )
+                                 values ( :old.service_order_id,
+                                          :old.trn,
+                                          :old.status,
+                                          :old.status_reason,
+                                          :old.status_updated,
+                                          :old.last_checked,
+                                          :old.date_created,
+                                          :old.reconcile_operation,
+                                          :old.order_id,
+                                          :old.last_kmi_date,
+                                          :old.last_sent_date,
+                                          :old.event_id,
+                                          :old.service_type,
+                                          :old.status_code
+                                           );
+
+    end if;
+
+END;
+
+
+------------------------------------------------------LOLIG_TRANS_TRG ------------------
+
+create or replace trigger bse.lolig_trans_trg
+    before insert on bse.lolig_trans for each row
+begin
+    select bse.lolig_trans_seq.nextval 
+        into :new.id from dual;
+end;
